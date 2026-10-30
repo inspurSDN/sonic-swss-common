@@ -6,7 +6,7 @@
 #include "common/redisreply.h"
 #include "common/rediscommand.h"
 #include "common/redisapi.h"
-#include "common/json.hpp"
+#include <nlohmann/json.hpp>
 
 using namespace std;
 using namespace swss;
@@ -82,7 +82,7 @@ bool Table::get(const string &key, vector<FieldValueTuple> &values)
     for (unsigned int i = 0; i < reply->elements; i += 2)
     {
         values.emplace_back(stripSpecialSym(reply->element[i]->str),
-                                    reply->element[i + 1]->str);
+                                    string(reply->element[i + 1]->str, reply->element[i + 1]->len));
     }
 
     return true;
@@ -140,8 +140,8 @@ void Table::set(const string &key, const vector<FieldValueTuple> &values,
 
     RedisCommand cmd;
     
-    cmd.formatHMSET(getKeyName(key), values.begin(), values.end());
-    m_pipe->push(cmd, REDIS_REPLY_STATUS);
+    cmd.formatHSET(getKeyName(key), values.begin(), values.end());
+    m_pipe->push(cmd, REDIS_REPLY_INTEGER);
     
     if (ttl != DEFAULT_DB_TTL)
     {

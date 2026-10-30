@@ -3,6 +3,8 @@
 #include <thread>
 #include <algorithm>
 #include <deque>
+#include <system_error>
+#include <gmock/gmock.h>
 #include "gtest/gtest.h"
 #include "common/dbconnector.h"
 #include "common/producertable.h"
@@ -10,15 +12,18 @@
 #include "common/notificationconsumer.h"
 #include "common/notificationproducer.h"
 #include "common/redisclient.h"
+#include "common/redisreply.h"
 #include "common/select.h"
 #include "common/selectableevent.h"
 #include "common/selectabletimer.h"
 #include "common/table.h"
 #include "common/dbinterface.h"
 #include "common/sonicv2connector.h"
+#include "common/redisutility.h"
 
 using namespace std;
 using namespace swss;
+using namespace testing;
 
 #define NUMBER_OF_THREADS   (64) // Spawning more than 256 threads causes libc++ to except
 #define NUMBER_OF_OPS     (1000)
@@ -143,6 +148,30 @@ void clearDB()
     DBConnector db("TEST_DB", 0, true);
     RedisReply r(&db, "FLUSHALL", REDIS_REPLY_STATUS);
     r.checkStatusOK();
+}
+
+long long commandCallCount(DBConnector& connector, const string& command)
+{
+    RedisReply reply(&connector, "INFO commandstats", REDIS_REPLY_STRING);
+    const string info = reply.getReply<string>();
+    const string prefix = "cmdstat_" + command + ":calls=";
+    const string::size_type start = info.find(prefix);
+    if (start == string::npos)
+    {
+        return 0;
+    }
+
+    const string::size_type valueStart = start + prefix.size();
+    const string::size_type valueEnd = info.find(',', valueStart);
+    return stoll(info.substr(valueStart, valueEnd - valueStart));
+}
+
+long long configurationWriteCallCount(DBConnector& connector)
+{
+    // Redis 7 and later report subcommands separately; older versions report
+    // CONFIG as a single command.
+    return commandCallCount(connector, "config") +
+           commandCallCount(connector, "config|set");
 }
 
 // Add "useDbId" to test connector objects made with dbId/dbName
@@ -316,15 +345,21 @@ TEST(DBConnector, RedisClientName)
 
 TEST(DBConnector, DBInterface)
 {
+    DBConnector statsDb("TEST_DB", 0, true);
+    const long long configCalls = configurationWriteCallCount(statsDb);
+
     DBInterface dbintf;
     dbintf.set_redis_kwargs("", "127.0.0.1", 6379);
     dbintf.connect(15, "TEST_DB");
+
+    EXPECT_EQ(configCalls, configurationWriteCallCount(statsDb));
 
     SonicV2Connector_Native db;
     db.connect("TEST_DB");
     db.set("TEST_DB", "key0", "field1", "value2");
     auto fvs = db.get_all("TEST_DB", "key0");
     auto rc = fvs.find("field1");
+    db.close();
     EXPECT_NE(rc, fvs.end());
     EXPECT_EQ(rc->second, "value2");
 }
@@ -475,6 +510,85 @@ TEST(DBConnector, RedisClient)
     EXPECT_TRUE(rc);
 
     cout << "Done." << endl;
+}
+
+TEST(DBConnector, HmsetAndDel)
+{
+    DBConnector db("TEST_DB", 0, true);
+    clearDB();
+
+    unordered_map<string, vector<pair<string, string>>> multiHash;
+    vector<FieldValueTuple> values;
+    values.push_back(make_pair("field_1", "1"));
+    values.push_back(make_pair("field_2", "2"));
+    
+    vector<string> keys;
+    for (int idx =0; idx<10; idx++)
+    {
+        string key = "hash_key_" + to_string(idx);
+        multiHash[key] = values;
+        keys.push_back(key);
+    }
+    
+    // set multiple hash with hmset
+    db.hmset(multiHash);
+    
+    // check all key exist
+    for (auto& key : keys)
+    {
+        auto fvs = db.hgetall(key);
+        EXPECT_EQ(fvs.size(), 2);
+
+        for (auto fv: fvs)
+        {
+            string value_1 = "1", value_2 = "2";
+            if (fvField(fv) == "field_1")
+            {
+                EXPECT_EQ(fvValue(fv), value_1);
+            }
+            if (fvField(fv) == "field_2")
+            {
+                EXPECT_EQ(fvValue(fv), value_2);
+            }
+        }
+    }
+    
+    // delete multiple hash with del
+    db.del(keys);
+    
+    // check all key deleted
+    for (auto& key : keys)
+    {
+        auto fvs = db.hgetall(key);
+        EXPECT_EQ(fvs.size(), 0);
+    }
+}
+
+TEST(DBConnector, DelMultipleKeys)
+{
+    DBConnector db("TEST_DB", 0, true);
+    clearDB();
+
+    vector<size_t> num_keys = {1, 128, 300};
+    vector<string> keys;
+    for (size_t i = 0; i < num_keys.size(); ++i)
+    {
+        size_t num_key = num_keys[i];
+        if (i > 0)
+        {
+            keys.clear();
+        }
+        for (size_t j = 0; j < num_key; ++j)
+        {
+            string key = "hash_key_" + to_string(j);
+            db.set(key, "value");
+            keys.push_back(key);
+        }
+        EXPECT_EQ(db.keys("*").size(), num_key);
+
+        db.del(keys);
+        EXPECT_EQ(db.keys("*").size(), 0);
+    }
 }
 
 TEST(DBConnector, test)
@@ -793,6 +907,34 @@ TEST(Table, ttl_test)
     cout << "Done." << endl;
 }
 
+TEST(Table, binary_data_get)
+{
+    DBConnector db("TEST_DB", 0, true);
+    Table table(&db, "binary_data");
+
+    const char bindata1[] = "\x11\x00\x22\x33\x44";
+    const char bindata2[] = "\x11\x22\x33\x00\x44";
+    auto v1 = std::string(bindata1, sizeof(bindata1));
+    auto v2 = std::string(bindata2, sizeof(bindata2));
+    vector<FieldValueTuple> values_set = {
+        {"f1", v1},
+        {"f2", v2},
+    };
+
+    table.set("k1", values_set);
+
+    vector<FieldValueTuple> values_get;
+    EXPECT_TRUE(table.get("k1", values_get));
+
+    auto f1 = swss::fvsGetValue(values_get, "f1");
+    auto f2 = swss::fvsGetValue(values_get, "f2");
+    EXPECT_TRUE(f1);
+    EXPECT_TRUE(f2);
+
+    EXPECT_EQ(*f1, v1);
+    EXPECT_EQ(*f2, v2);
+}
+
 TEST(ProducerConsumer, Prefix)
 {
     std::string tableName = "tableName";
@@ -1056,4 +1198,62 @@ TEST(Connector, hmset)
 
     // test empty multi hash
     db.hmset({});
+}
+
+TEST(Connector, connectFail)
+{
+    // connect to an ip which is not a redis server
+    EXPECT_THROW({
+        try
+        {
+            DBConnector db(0, "1.1.1.1", 6379, 1);
+        }
+        catch(const std::system_error& e)
+        {
+            EXPECT_THAT(e.what(), HasSubstr("Unable to connect to redis - "));
+            throw;
+        }
+    }, std::system_error);
+
+    // connect to an invalid unix socket address
+    EXPECT_THROW({
+        try
+        {
+            DBConnector db(0, "/tmp/invalid", 1);
+        }
+        catch(const std::system_error& e)
+        {
+            EXPECT_THAT(e.what(), HasSubstr("Unable to connect to redis (unix-socket) - "));
+            throw;
+        }
+    }, std::system_error);
+}
+
+TEST(Redisreply, guard)
+{
+    // Improve test coverage for guard() method.
+    string command = "test";
+    EXPECT_THROW({
+        try
+        {
+            guard([&]{throw system_error(make_error_code(errc::io_error), "LOADING Redis is loading the dataset in memory");}, command.c_str());
+        }
+        catch(const std::system_error& e)
+        {
+            EXPECT_THAT(e.what(), HasSubstr("LOADING Redis is loading the dataset in memory"));
+            throw;
+        }
+    }, std::system_error);
+
+    EXPECT_THROW({
+        try
+        {
+            guard([&]{throw system_error(make_error_code(errc::io_error), "Command failed");}, command.c_str());
+        }
+        catch(const std::system_error& e)
+        {
+            EXPECT_THAT(e.what(), HasSubstr("Command failed"));
+            throw;
+        }
+    }, std::system_error);
 }

@@ -1,0 +1,113 @@
+#pragma once
+
+#include <string>
+#include <deque>
+#include <list>
+#include <condition_variable>
+#include "asyncdbupdater.h"
+#include "consumertablebase.h"
+#include "dbconnector.h"
+#include "selectableevent.h"
+#include "table.h"
+#include "zmqserver.h"
+
+namespace swss {
+
+class ZmqConsumerStateTable : public Selectable, public TableBase, public ZmqMessageHandler
+{
+public:
+    /* The default value of pop batch size is 128 */
+    static constexpr int DEFAULT_POP_BATCH_SIZE = 128;
+
+    ZmqConsumerStateTable(DBConnector *db, const std::string &tableName, ZmqServer &zmqServer, int popBatchSize = DEFAULT_POP_BATCH_SIZE, int pri = 0, bool dbPersistence = false);
+
+    ~ZmqConsumerStateTable() override;
+
+    /* Get multiple pop elements */
+    void pops(std::deque<KeyOpFieldsValuesTuple> &vkco, const std::string &prefix = EMPTY_PREFIX);
+
+    /* return file handler for the Selectable */
+    int getFd() override
+    {
+        return m_selectableEvent.getFd();
+    }
+
+    /* Read all data from the fd assicaited with Selectable */
+    uint64_t readData() override
+    {
+        return m_selectableEvent.readData();
+    }
+
+    /*
+       true if Selectable has data in it for immediate read
+       This method is intended to be implemented in subclasses of Selectable
+       which also implement the hasCachedData() method
+       it's possible to have a case, when an application read all cached data after a signal,
+       and we have a Selectable with no data in the m_ready queue (Select class).
+       The class without hasCachedData never is going to be in m_ready state without the data
+    */
+    bool hasData() override
+    {
+        std::lock_guard<std::mutex> lock(m_receivedQueueMutex);
+        return !m_receivedOperationQueue.empty();
+    }
+
+    /* true if Selectable has data in its cache */
+    bool hasCachedData() override
+    {
+        return hasData();
+    }
+
+    /* true if Selectable was initialized with data */
+    bool initializedWithData() override
+    {
+        // TODO, if we need load data from redis during initialize, don't forget change code here.
+        return false;
+    }
+
+    const DBConnector* getDbConnector() const
+    {
+        return m_db;
+    }
+
+    size_t dbUpdaterQueueSize();
+
+protected:
+    virtual void handleReceivedData(const std::vector<std::shared_ptr<KeyOpFieldsValuesTuple>> &kcos);
+
+    // Unregister this handler from the ZmqHandlerRegistry. Idempotent: a
+    // second call (e.g. the base destructor running after a subclass has
+    // already detached) finds nothing and returns. removeHandler() blocks
+    // until any in-flight dispatch into us returns and prevents new ones.
+    //
+    // A subclass that adds members read on the ingress path (e.g.
+    // ZmqRouteConsumerStateTable::m_ingressCallback) MUST call this from its
+    // own destructor: base-class destruction runs only after the subclass's
+    // members are already gone, so relying on ~ZmqConsumerStateTable() alone
+    // leaves a window where mqPollThread can dispatch into a half-destroyed
+    // object and read a destroyed member.
+    void detachFromRegistry();
+
+    swss::SelectableEvent m_selectableEvent;
+
+    std::unique_ptr<AsyncDBUpdater> m_asyncDBUpdater;
+
+private:
+    std::mutex m_receivedQueueMutex;
+
+    std::queue<std::shared_ptr<KeyOpFieldsValuesTuple>, std::list<std::shared_ptr<KeyOpFieldsValuesTuple>>> m_receivedOperationQueue;
+
+    DBConnector *m_db;
+
+    // Cached at construction time so the destructor can call
+    // m_handlerRegistry->removeHandler() without dereferencing m_db.
+    std::string m_dbName;
+
+    // Co-owned with the ZmqServer that created us. Lets the destructor
+    // unregister cleanly even if the ZmqServer has already been destroyed.
+    std::shared_ptr<ZmqHandlerRegistry> m_handlerRegistry;
+
+    size_t m_popBatchSize;
+};
+
+}

@@ -79,6 +79,7 @@ for i = n, 1, -3 do
        op == 'flush' or
        op == 'flushresponse' or
        op == 'get' or
+       op == 'bulkget' or
        op == 'getresponse' or
        op == 'notify' or
        op == 'get_stats' or
@@ -88,7 +89,12 @@ for i = n, 1, -3 do
        op == 'attr_enum_values_capability_query' or
        op == 'attr_enum_values_capability_response' or
        op == 'object_type_get_availability_query' or
-       op == 'object_type_get_availability_response' then
+       op == 'object_type_get_availability_response' or
+       op == 'stats_capability_query' or
+       op == 'stats_capability_response' or
+       op == 'stats_st_capability_query' or
+       op == 'stats_st_capability_response' or
+       op == 'link_event_damping_config_set' then
 
     -- do not modify db entries when spotted those commands, they are used to
     -- trigger actions or get data synchronously from database

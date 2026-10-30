@@ -1,12 +1,22 @@
 import os
 import time
+import psutil
 import pytest
 import multiprocessing
 from threading import Thread
 from pympler.tracker import SummaryTracker
 from swsscommon import swsscommon
-from swsscommon.swsscommon import ConfigDBPipeConnector, DBInterface, SonicV2Connector, SonicDBConfig, ConfigDBConnector, SonicDBConfig, transpose_pops
+from swsscommon.swsscommon import ConfigDBPipeConnector, DBInterface, SonicV2Connector, SonicDBConfig, ConfigDBConnector, SonicDBConfig, transpose_pops, SonicDBKey
 import json
+import gc
+
+import sys
+if sys.version_info.major == 3:
+    from unittest import mock
+else:
+    # Expect the 'mock' package for python 2
+    # https://pypi.python.org/pypi/mock
+    import mock
 
 def test_ProducerTable():
     db = swsscommon.DBConnector("APPL_DB", 0, True)
@@ -381,6 +391,7 @@ def test_ConfigDBConnector():
 def test_ConfigDBConnectorSeparator():
     db = swsscommon.DBConnector("APPL_DB", 0, True)
     config_db = ConfigDBConnector()
+    # set wait for init to True to cover wait_for_init code.
     config_db.db_connect("APPL_DB", False, False)
     config_db.get_redis_client(config_db.APPL_DB).flushdb()
     config_db.set_entry("TEST_PORT", "Ethernet222", {"alias": "etp2x"})
@@ -473,6 +484,12 @@ def test_ConfigDBPipeConnector():
     allconfig = config_db.get_config()
     assert len(allconfig["PORT_TABLE"]) == 1000
 
+    # Verify modify config with {} will no action
+    config_db.mod_config({'PORT_TABLE':{}})
+    allconfig = config_db.get_config()
+    assert len(allconfig["PORT_TABLE"]) == 1000
+
+    # Verify modify config with None will delete table
     allconfig["PORT_TABLE"] = None
     config_db.mod_config(allconfig)
     allconfig = config_db.get_config()
@@ -627,46 +644,98 @@ def test_ConfigDBSubscribe():
 def test_ConfigDBInit():
     table_name_1 = 'TEST_TABLE_1'
     table_name_2 = 'TEST_TABLE_2'
+    table_name_3 = 'TEST_TABLE_3'
     test_key = 'key1'
-    test_data = {'field1': 'value1'}
-    test_data_update = {'field1': 'value2'}
+    test_data = {'field1': 'value1', 'field2': 'value2'}
+
+    queue = multiprocessing.Queue()
 
     manager = multiprocessing.Manager()
     ret_data = manager.dict()
 
-    def test_handler(table, key, data, ret):
-        ret[table] = {key: data}
+    def test_handler(table, key, data, ret, q=None):
+        if table not in ret:
+            ret[table] = {}
+        if data is None:
+            ret[table] = {k: v for k, v in ret[table].items() if k != key}
+            if q:
+                q.put(ret[table])
+        elif key not in ret[table] or ret[table][key] != data:
+            ret[table] = {key: data}
+            if q:
+                q.put(ret[table])
 
-    def test_init_handler(data, ret):
+    def test_init_handler(data, ret, queue):
         ret.update(data)
+        queue.put(ret)
 
-    def thread_listen(ret):
+    def thread_listen(ret, queue):
         config_db = ConfigDBConnector()
         config_db.connect(wait_for_init=False)
 
-        config_db.subscribe(table_name_1, lambda table, key, data: test_handler(table, key, data, ret),
+        config_db.subscribe(table_name_1, lambda table, key, data: test_handler(table, key, data, ret, queue),
                             fire_init_data=False)
-        config_db.subscribe(table_name_2, lambda table, key, data: test_handler(table, key, data, ret),
+        config_db.subscribe(table_name_2, lambda table, key, data: test_handler(table, key, data, ret, queue),
                             fire_init_data=True)
+        config_db.subscribe(table_name_3, lambda table, key, data: test_handler(table, key, data, ret, queue),
+                            fire_init_data=False)
 
-        config_db.listen(init_data_handler=lambda data: test_init_handler(data, ret))
+        config_db.listen(init_data_handler=lambda data: test_init_handler(data, ret, queue))
 
     config_db = ConfigDBConnector()
     config_db.connect(wait_for_init=False)
     client = config_db.get_redis_client(config_db.CONFIG_DB)
     client.flushdb()
 
-    # Init table data
-    config_db.set_entry(table_name_1, test_key, test_data)
-    config_db.set_entry(table_name_2, test_key, test_data)
+    # Prepare unique data per each table to track if correct data are received in the update
+    table_1_data = {f'{table_name_1}_{k}': v for k, v in test_data.items()}
+    config_db.set_entry(table_name_1, test_key, table_1_data)
+    table_2_data = {f'{table_name_2}_{k}': v for k, v in test_data.items()}
+    config_db.set_entry(table_name_2, test_key, table_2_data)
+    config_db.set_entry(table_name_3, test_key, {})
 
-    thread = multiprocessing.Process(target=thread_listen, args=(ret_data,))
-    thread.start()
-    time.sleep(5)
-    thread.terminate()
+    # Run the listener in a separate process. It is not possible to stop a listener when it is running as a thread. 
+    # When it runs in a separate process we can terminate it with a signal.
+    listener = multiprocessing.Process(target=thread_listen, args=(ret_data, queue))
+    listener.start()
 
-    assert ret_data[table_name_1] == {test_key: test_data}
-    assert ret_data[table_name_2] == {test_key: test_data}
+    try:
+        # During the subscription to table 2 'fire_init_data=True' is passed. The callback should be called before the listener.
+        # Verify that callback is fired before listener initialization.
+        data = queue.get(timeout=5)
+        assert data == {test_key: table_2_data}
+
+        # Wait for init data
+        init_data = queue.get(timeout=5)
+
+        # Verify that all tables initialized correctly
+        assert init_data[table_name_1] == {test_key: table_1_data}
+        assert init_data[table_name_2] == {test_key: table_2_data}
+        assert init_data[table_name_3] == {test_key: {}}
+
+        # Remove one key-value pair from the data. Verify that the entry is updated correctly
+        table_1_data.popitem()
+        config_db.set_entry(table_name_1, test_key, table_1_data)
+        data = queue.get(timeout=5)
+        assert data == {test_key: table_1_data}
+
+        # Remove all key-value pairs. Verify that the table still contains key
+        config_db.set_entry(table_name_1, test_key, {})
+        data = queue.get(timeout=5)
+        assert data == {test_key: {}}
+
+        # Remove the key
+        config_db.set_entry(table_name_1, test_key, None)
+        data = queue.get(timeout=5)
+        assert test_key not in data
+
+        # Remove the entry (with no attributes) from the table.
+        # Verify that the update is received and a callback is called
+        config_db.set_entry(table_name_3, test_key, None)
+        table_3_data = queue.get(timeout=5)
+        assert test_key not in table_3_data
+    finally:
+        listener.terminate()
 
 
 def test_DBConnectFailure():
@@ -676,4 +745,146 @@ def test_DBConnectFailure():
     nonexisting_host = "."
     with pytest.raises(RuntimeError):
         db = swsscommon.DBConnector(0, nonexisting_host, 0)
+
+def test_SonicDBConfigGetInstanceList():
+    """ Verify that SonicDBConfig.getInstanceList will return correct redis instance information """
+
+    instanceList = swsscommon.SonicDBConfig.getInstanceList()
+    keys = instanceList.keys()
+
+    assert keys[0] == 'redis'
+    assert instanceList['redis'].unixSocketPath == '/var/run/redis/redis.sock'
+    assert instanceList['redis'].hostname == '127.0.0.1'
+    assert instanceList['redis'].port == 6379
+
+
+def test_SonicV2Connector():
+    db = SonicV2Connector(use_unix_socket_path=True)
+    db.connect("TEST_DB")
+    
+    db.set("TEST_DB", "test_key", "field1", 1)
+    value = db.get("TEST_DB", "test_key", "field1")
+    assert value == "1"
+
+def test_ConfigDBWaitInit():
+    config_db = ConfigDBConnector()
+    config_db.connect(wait_for_init=False)
+    client = config_db.get_redis_client(config_db.CONFIG_DB)
+    suc = client.set(config_db.INIT_INDICATOR, 1)
+    assert suc
+
+    # set wait for init to True to cover wait_for_init code.
+    config_db = ConfigDBConnector()
+    config_db.db_connect(config_db.CONFIG_DB, True, False)
+
+    config_db.set_entry("TEST_PORT", "Ethernet111", {"alias": "etp1x"})
+    allconfig = config_db.get_config()
+    assert allconfig["TEST_PORT"]["Ethernet111"]["alias"] == "etp1x"
+
+
+def test_ConfigDBConnector():
+    config_db = ConfigDBConnector()
+    config_db.connect(wait_for_init=False)
+    config_db.get_redis_client(config_db.CONFIG_DB).flushdb()
+
+    #
+    # mod_config
+    #
+
+    # Verify table delete
+    allconfig = config_db.get_config()
+    for i in range(1, 1001, 1):
+        # Make sure we have enough entries to trigger REDIS_SCAN_BATCH_SIZE
+        allconfig.setdefault("PORT_TABLE", {}).setdefault("Ethernet{}".format(i), {})
+        allconfig["PORT_TABLE"]["Ethernet{}".format(i)]["alias"] = "etp{}x".format(i)
+
+    config_db.mod_config(allconfig)
+    allconfig = config_db.get_config()
+    assert len(allconfig["PORT_TABLE"]) == 1000
+
+    # Verify modify config with {} will no action
+    config_db.mod_config({'PORT_TABLE':{}})
+    allconfig = config_db.get_config()
+    assert len(allconfig["PORT_TABLE"]) == 1000
+
+    # Verify modify config with None will delete table
+    allconfig["PORT_TABLE"] = None
+    config_db.mod_config(allconfig)
+    allconfig = config_db.get_config()
+    assert len(allconfig) == 0
+
+
+@mock.patch("swsscommon.swsscommon.ConfigDBConnector.close")
+def test_ConfigDBConnector_with_statement(self):
+    # test ConfigDBConnector support 'with' statement
+    with ConfigDBConnector() as config_db:
+        assert config_db.db_name == ""
+        assert config_db.TABLE_NAME_SEPARATOR == "|"
+        config_db.connect(wait_for_init=False)
+        assert config_db.db_name == "CONFIG_DB"
+        assert config_db.TABLE_NAME_SEPARATOR == "|"
+        config_db.get_redis_client(config_db.CONFIG_DB).flushdb()
+        config_db.set_entry("TEST_PORT", "Ethernet111", {"alias": "etp1x"})
+        allconfig = config_db.get_config()
+        assert allconfig["TEST_PORT"]["Ethernet111"]["alias"] == "etp1x"
+
+    # check close() method called by with statement
+    ConfigDBConnector.close.assert_called_once_with()
+
+
+def test_SmartSwitchDBConnector():
+    test_dir = os.path.dirname(os.path.abspath(__file__))
+    global_db_config = os.path.join(test_dir, 'redis_multi_db_ut_config', 'database_global.json')
+    SonicDBConfig.load_sonic_global_db_config(global_db_config)
+    global_db_config_json = json.load(open(global_db_config))
+    db_key = SonicDBKey()
+    db_key.containerName = "dpu0"
+    db = swsscommon.DBConnector("DPU_APPL_DB", 0, True, db_key)
+    tbl = swsscommon.Table(db, "DASH_ENI_TABLE")
+    fvs = swsscommon.FieldValuePairs([('dashfield1','dashvalue1'), ('dashfield2', 'dashvalue2')])
+    tbl.set("dputest1", fvs)
+    tbl.set("dputest2", fvs)
+    keys = tbl.getKeys()
+    assert len(keys) == 2
+    assert "dputest1" in keys
+    assert "dputest2" in keys
+    assert tbl.get("dputest1")[1][0] == ("dashfield1", "dashvalue1")
+    assert tbl.get("dputest2")[1][1] == ("dashfield2", "dashvalue2")
+    assert len(SonicDBConfig.getDbKeys()) == len(global_db_config_json["INCLUDES"])
+
+
+def test_TableSetBinary():
+    app_db = swsscommon.DBConnector("APPL_DB", 0, True)
+    t = swsscommon.Table(app_db, "TABLE")
+    buff = b""
+    for i in range(0, 256):
+        buff += bytes([i])
+    buff = buff.decode('latin-1')
+    fvs = swsscommon.FieldValuePairs([("binary", buff)])
+    t.set("binary", fvs)
+    (status, fvs) = t.get("binary")
+    assert status == True
+    assert fvs[0][1] == buff
+
+
+def test_TableOpsMemoryLeak():
+    OP_COUNT = 50000
+    app_db = swsscommon.DBConnector("APPL_DB", 0, True)
+    t = swsscommon.Table(app_db, "TABLE")
+    long_data = "x" * 100
+    fvs = swsscommon.FieldValuePairs([(long_data, long_data)])
+
+    def run_ops():
+        for _ in range(OP_COUNT):
+            t.set("long_data", fvs)
+            t.get("long_data")
+
+    # Warm up first: a fresh process grows RSS by a one-time amount (allocator
+    # arenas, redis client buffers, interpreter caches) that is unrelated to any
+    # leak. Measure the SECOND, steady-state batch instead -- a real per-op leak
+    # keeps growing linearly, so post-warmup growth must stay near zero.
+    run_ops()
+    rss = psutil.Process(os.getpid()).memory_info().rss
+    run_ops()
+    assert psutil.Process(os.getpid()).memory_info().rss - rss < OP_COUNT
 

@@ -1,10 +1,19 @@
 #pragma once
 
 #include <string>
+#include <queue>
+#include <unordered_set>
 #include <functional>
+#include <chrono>
+#include <iostream>
 #include "redisreply.h"
 #include "rediscommand.h"
 #include "dbconnector.h"
+#include "logger.h"
+
+#include "unistd.h"
+#include "sys/syscall.h"
+#define gettid() syscall(SYS_gettid)
 
 namespace swss {
 
@@ -16,13 +25,45 @@ public:
     RedisPipeline(const DBConnector *db, size_t sz = 128)
         : COMMAND_MAX(sz)
         , m_remaining(0)
+        , m_shaPub("")
     {
         m_db = db->newConnector(NEWCONNECTOR_TIMEOUT);
+        initializeOwnerTid();
+        lastHeartBeat = std::chrono::steady_clock::now();
     }
 
-    ~RedisPipeline() {
-        flush();
-        delete m_db;
+    ~RedisPipeline() noexcept {
+        try 
+        {
+            std::string dbName = getDbName();
+            
+            if (m_ownerTid == gettid())
+            {
+                // call flush from different thread will trigger race condition issue.
+                try
+                {
+                    flush();
+                }
+                catch (const std::exception& e)
+                {
+                    SWSS_LOG_ERROR("Exception during RedisPipeline flush in destructor: %s, Database: %s", e.what(), dbName.c_str());
+                }
+            }
+            else
+            {
+                SWSS_LOG_NOTICE("RedisPipeline dtor is called from another thread, possibly due to exit(), Database: %s", dbName.c_str());
+            }
+
+            delete m_db;
+        }
+        catch (const std::exception& e)
+        {
+            fprintf(stderr, "Exception during RedisPipeline destructor: %s\n", e.what());
+        }
+        catch (...)
+        {
+            fprintf(stderr, "Unknown exception during RedisPipeline destructor\n");
+        }
     }
 
     redisReply *push(const RedisCommand& command, int expectedType)
@@ -33,7 +74,7 @@ public:
             case REDIS_REPLY_STATUS:
             case REDIS_REPLY_INTEGER:
             {
-                int rc = redisAppendFormattedCommand(m_db->getContext(), command.c_str(), command.length());
+                int rc = command.appendTo(m_db->getContext());
                 if (rc != REDIS_OK)
                 {
                     // The only reason of error is REDIS_ERR_OOM (Out of memory)
@@ -97,11 +138,19 @@ public:
 
     void flush()
     {
+        lastHeartBeat = std::chrono::steady_clock::now();
+
+        if (m_remaining == 0) {
+            return;
+        }
+
         while(m_remaining)
         {
             // Construct an object to use its dtor, so that resource is released
             RedisReply r(pop());
         }
+
+        publish();
     }
 
     size_t size()
@@ -124,10 +173,47 @@ public:
         return m_db;
     }
 
+    void initializeOwnerTid()
+    {
+        m_ownerTid = gettid();
+    }
+
+    void addChannel(std::string channel)
+    {
+        if (m_channels.find(channel) != m_channels.end())
+            return;
+
+        m_channels.insert(channel);
+        m_luaPub += "redis.call('PUBLISH', '" + channel + "', 'G')\n";
+        m_shaPub = loadRedisScript(m_luaPub);
+    }
+
+    int getIdleTime(std::chrono::time_point<std::chrono::steady_clock> tcurrent=std::chrono::steady_clock::now())
+    {
+        return static_cast<int>(std::chrono::duration_cast<std::chrono::milliseconds>(tcurrent - lastHeartBeat).count());
+    }
+
+    void publish() {
+        if (m_shaPub.empty()) {
+            return;
+        }
+        RedisCommand cmd;
+        cmd.format(
+            "EVALSHA %s 0",
+            m_shaPub.c_str());
+        RedisReply r(m_db, cmd);
+    }
+
 private:
     DBConnector *m_db;
     std::queue<int> m_expectedTypes;
     size_t m_remaining;
+    long int m_ownerTid;
+
+    std::string m_luaPub;
+    std::string m_shaPub;
+    std::chrono::time_point<std::chrono::steady_clock> lastHeartBeat; // marks the timestamp of latest pipeline flush being invoked
+    std::unordered_set<std::string> m_channels;
 
     void mayflush()
     {

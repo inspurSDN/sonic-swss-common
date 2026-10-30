@@ -5,7 +5,7 @@
 #include <limits>
 
 #include "common/json.h"
-#include "common/json.hpp"
+#include <nlohmann/json.hpp>
 
 using namespace std;
 
@@ -20,6 +20,19 @@ string JSon::buildJson(const vector<FieldValueTuple> &fv)
     {
         j.push_back(fvField(i));
         j.push_back(fvValue(i));
+    }
+
+    return j.dump();
+}
+
+string JSon::buildJson(const char** values)
+{
+    nlohmann::json j = nlohmann::json::array();
+
+    while (*values)
+    {
+        j.push_back(string(*values));
+        values++;
     }
 
     return j.dump();

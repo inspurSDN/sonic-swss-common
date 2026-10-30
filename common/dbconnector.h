@@ -1,22 +1,44 @@
-#ifndef __DBCONNECTOR__
+    #ifndef __DBCONNECTOR__
 #define __DBCONNECTOR__
 
 #include <string>
+#include <stdexcept>
+#include <system_error>
 #include <vector>
 #include <unordered_map>
 #include <utility>
+#include <map>
 #include <memory>
 #include <mutex>
+#include <boost/functional/hash.hpp>
+#include <boost/algorithm/string.hpp>
 
 #include <hiredis/hiredis.h>
 #include "rediscommand.h"
 #include "redisreply.h"
 #define EMPTY_NAMESPACE std::string()
+#define EMPTY_CONTAINERNAME std::string()
 
 namespace swss {
 
 class DBConnector;
 class PubSub;
+
+// Authentication errors must leave connection retry loops immediately.
+#ifndef SWIG
+class RedisAuthError : public std::runtime_error
+{
+public:
+    using std::runtime_error::runtime_error;
+};
+
+// Keep local descriptor failures out of connection retry loops.
+class RedisDescriptorError : public std::system_error
+{
+public:
+    using std::system_error::system_error;
+};
+#endif
 
 class RedisInstInfo
 {
@@ -34,13 +56,59 @@ public:
     std::string separator;
 };
 
+struct SonicDBKey
+{
+    /* Container name is used to identify the container that the DB instance is running in.
+     * Namespace is used to identify the network namespace that the DB instance is running in.
+     * In our design, we allow multiple containers to share a same namespace.
+     * So, this combination of container name and namespace is used to uniquely identify a DB instance.
+     * If the namespace is empty, it means the DB instance is running in the default(host) namespace.
+     * If the container name is empty, it for adapting the old design that only one DB instance is
+     * running in a namespace.
+     */
+    std::string containerName;
+    std::string netns;
+
+    SonicDBKey() = default;
+    SonicDBKey(const std::string &ns) : netns(ns) {}
+
+    bool operator==(const SonicDBKey& other) const
+    {
+        return containerName == other.containerName && netns == other.netns;
+    }
+
+    bool isEmpty() const
+    {
+        return containerName.empty() && netns.empty();
+    }
+
+    std::string toString() const
+    {
+        std::vector<std::string> buffer;
+        buffer.push_back(containerName);
+        buffer.push_back(netns);
+        return boost::algorithm::join(buffer, ":");
+    }
+};
+
+struct SonicDBKeyHash
+{
+    std::size_t operator()(const SonicDBKey& k) const
+    {
+        std::size_t seed = 0;
+        boost::hash_combine(seed, k.containerName);
+        boost::hash_combine(seed, k.netns);
+        return seed;
+    }
+};
+
 class SonicDBConfig
 {
 public:
     static constexpr const char *DEFAULT_SONIC_DB_CONFIG_FILE = "/var/run/redis/sonic-db/database_config.json";
     static constexpr const char *DEFAULT_SONIC_DB_GLOBAL_CONFIG_FILE = "/var/run/redis/sonic-db/database_global.json";
     static void initialize(const std::string &file = DEFAULT_SONIC_DB_CONFIG_FILE);
-#ifdef SWIG
+#if defined(SWIG) && defined(SWIGPYTHON)
     %pythoncode %{
         ## TODO: the python function and C++ one is not on-par
         @staticmethod
@@ -49,27 +117,36 @@ public:
     %}
 #endif
 
-    static void initializeGlobalConfig(const std::string &file = DEFAULT_SONIC_DB_GLOBAL_CONFIG_FILE);
-#ifdef SWIG
+    static void initializeGlobalConfig(const std::string &file = DEFAULT_SONIC_DB_GLOBAL_CONFIG_FILE, bool ignore_nonexistent = false);
+#if defined(SWIG) && defined(SWIGPYTHON)
     %pythoncode %{
         ## TODO: the python function and C++ one is not on-par
         @staticmethod
-        def load_sonic_global_db_config(global_db_file_path=DEFAULT_SONIC_DB_GLOBAL_CONFIG_FILE, namespace=None):
-            SonicDBConfig.initializeGlobalConfig(global_db_file_path)
+        def load_sonic_global_db_config(global_db_file_path=DEFAULT_SONIC_DB_GLOBAL_CONFIG_FILE, namespace=None, ignore_nonexistent=False):
+            SonicDBConfig.initializeGlobalConfig(global_db_file_path, ignore_nonexistent)
     %}
 #endif
+    static void reset();
 
     static void validateNamespace(const std::string &netns);
-    static std::string getDbInst(const std::string &dbName, const std::string &netns = EMPTY_NAMESPACE);
-    static int getDbId(const std::string &dbName, const std::string &netns = EMPTY_NAMESPACE);
-    static std::string getSeparator(const std::string &dbName, const std::string &netns = EMPTY_NAMESPACE);
-    static std::string getSeparator(int dbId, const std::string &netns = EMPTY_NAMESPACE);
+    static std::string getDbInst(const std::string &dbName, const std::string &netns = EMPTY_NAMESPACE, const std::string &containerName=EMPTY_CONTAINERNAME);
+    static std::string getDbInst(const std::string &dbName, const SonicDBKey &key);
+    static int getDbId(const std::string &dbName, const std::string &netns = EMPTY_NAMESPACE, const std::string &containerName=EMPTY_CONTAINERNAME);
+    static int getDbId(const std::string &dbName, const SonicDBKey &key);
+    static std::string getSeparator(const std::string &dbName, const std::string &netns = EMPTY_NAMESPACE, const std::string &containerName=EMPTY_CONTAINERNAME);
+    static std::string getSeparator(const std::string &dbName, const SonicDBKey &key);
+    static std::string getSeparator(int dbId, const std::string &netns = EMPTY_NAMESPACE, const std::string &containerName=EMPTY_CONTAINERNAME);
+    static std::string getSeparator(int dbId, const SonicDBKey &key);
     static std::string getSeparator(const DBConnector* db);
-    static std::string getDbSock(const std::string &dbName, const std::string &netns = EMPTY_NAMESPACE);
-    static std::string getDbHostname(const std::string &dbName, const std::string &netns = EMPTY_NAMESPACE);
-    static int getDbPort(const std::string &dbName, const std::string &netns = EMPTY_NAMESPACE);
+    static std::string getDbSock(const std::string &dbName, const std::string &netns = EMPTY_NAMESPACE, const std::string &containerName=EMPTY_CONTAINERNAME);
+    static std::string getDbSock(const std::string &dbName, const SonicDBKey &key);
+    static std::string getDbHostname(const std::string &dbName, const std::string &netns = EMPTY_NAMESPACE, const std::string &containerName=EMPTY_CONTAINERNAME);
+    static std::string getDbHostname(const std::string &dbName, const SonicDBKey &key);
+    static int getDbPort(const std::string &dbName, const std::string &netns = EMPTY_NAMESPACE, const std::string &containerName=EMPTY_CONTAINERNAME);
+    static int getDbPort(const std::string &dbName, const SonicDBKey &key);
     static std::vector<std::string> getNamespaces();
-#ifdef SWIG
+    static std::vector<SonicDBKey> getDbKeys();
+#if defined(SWIG) && defined(SWIGPYTHON)
     %pythoncode %{
         ## TODO: the python function and C++ one is not on-par
         @staticmethod
@@ -78,26 +155,30 @@ public:
     %}
 #endif
 
-    static std::vector<std::string> getDbList(const std::string &netns = EMPTY_NAMESPACE);
+    static std::vector<std::string> getDbList(const std::string &netns = EMPTY_NAMESPACE, const std::string &containerName=EMPTY_CONTAINERNAME);
+    static std::vector<std::string> getDbList(const SonicDBKey &key);
     static bool isInit() { return m_init; };
     static bool isGlobalInit() { return m_global_init; };
+    static std::map<std::string, RedisInstInfo> getInstanceList(const std::string &netns = EMPTY_NAMESPACE, const std::string &containerName=EMPTY_CONTAINERNAME);
+    static std::map<std::string, RedisInstInfo> getInstanceList(const SonicDBKey &key);
 
 private:
     static std::recursive_mutex m_db_info_mutex;
-    // { namespace { instName, { unix_socket_path, hostname, port } } }
-    static std::unordered_map<std::string, std::unordered_map<std::string, RedisInstInfo>> m_inst_info;
-    // { namespace, { dbName, {instName, dbId, separator} } }
-    static std::unordered_map<std::string, std::unordered_map<std::string, SonicDBInfo>> m_db_info;
-    // { namespace, { dbId, separator } }
-    static std::unordered_map<std::string, std::unordered_map<int, std::string>> m_db_separator;
+    // { {containerName, namespace}, { instName, { unix_socket_path, hostname, port } } }
+    static std::unordered_map<SonicDBKey, std::map<std::string, RedisInstInfo>, SonicDBKeyHash> m_inst_info;
+    // { {containerName, namespace}, { dbName, {instName, dbId, separator} } }
+    static std::unordered_map<SonicDBKey, std::unordered_map<std::string, SonicDBInfo>, SonicDBKeyHash> m_db_info;
+    // { {containerName, namespace}, { dbId, separator } }
+    static std::unordered_map<SonicDBKey, std::unordered_map<int, std::string>, SonicDBKeyHash> m_db_separator;
     static bool m_init;
     static bool m_global_init;
     static void parseDatabaseConfig(const std::string &file,
-                                    std::unordered_map<std::string, RedisInstInfo> &inst_entry,
+                                    std::map<std::string, RedisInstInfo> &inst_entry,
                                     std::unordered_map<std::string, SonicDBInfo> &db_entry,
-                                    std::unordered_map<int, std::string> &separator_entry);
-    static SonicDBInfo& getDbInfo(const std::string &dbName, const std::string &netns = EMPTY_NAMESPACE);
-    static RedisInstInfo& getRedisInfo(const std::string &dbName, const std::string &netns = EMPTY_NAMESPACE);
+                                    std::unordered_map<int, std::string> &separator_entry,
+                                    bool ignore_nonexistent = false);
+    static RedisInstInfo& getRedisInfo(const std::string &dbName, const SonicDBKey &key);
+    static SonicDBInfo& getDbInfo(const std::string &dbName, const SonicDBKey &key);
 };
 
 class RedisContext
@@ -151,32 +232,37 @@ public:
      */
     explicit DBConnector(const DBConnector &other);
     DBConnector(int dbId, const RedisContext &ctx);
-    DBConnector(int dbId, const std::string &hostname, int port, unsigned int timeout);
-    DBConnector(int dbId, const std::string &unixPath, unsigned int timeout);
-    DBConnector(const std::string &dbName, unsigned int timeout, bool isTcpConn = false);
-    DBConnector(const std::string &dbName, unsigned int timeout, bool isTcpConn, const std::string &netns);
+    DBConnector(int dbId, const std::string &hostname, int port, unsigned int timeout_ms);
+    DBConnector(int dbId, const std::string &unixPath, unsigned int timeout_ms);
+    DBConnector(const std::string &dbName, unsigned int timeout_ms, bool isTcpConn = false);
+    DBConnector(const std::string &dbName, unsigned int timeout_ms, bool isTcpConn, const std::string &netns);
+    DBConnector(const std::string &dbName, unsigned int timeout_ms, bool isTcpConn, const SonicDBKey &key);
     DBConnector& operator=(const DBConnector&) = delete;
 
     int getDbId() const;
     std::string getDbName() const;
     std::string getNamespace() const;
 
-#ifdef SWIG
+#if defined(SWIG) && defined(SWIGPYTHON)
     %pythoncode %{
         namespace = property(getNamespace)
     %}
 #endif
+    SonicDBKey getDBKey() const;
 
     static void select(DBConnector *db);
 
     /* Create new context to DB */
     DBConnector *newConnector(unsigned int timeout) const;
 
+#ifndef SWIG
+    __attribute__((deprecated))
+#endif
     PubSub *pubsub();
 
     int64_t del(const std::string &key);
 
-#ifdef SWIG
+#if defined(SWIG) && defined(SWIGPYTHON)
     // SWIG interface file (.i) globally rename map C++ `del` to python `delete`,
     // but applications already followed the old behavior of auto renamed `_del`.
     // So we implemented old behavior for backward compatibility
@@ -243,14 +329,14 @@ public:
 
     bool flushdb();
 
+    std::map<std::string, std::map<std::string, std::map<std::string, std::string>>> getall();
 private:
     void setNamespace(const std::string &netns);
+    void setDBKey(const SonicDBKey &key);
 
     int m_dbId;
     std::string m_dbName;
-    std::string m_namespace;
-
-    std::string m_shaRedisMulti;
+    SonicDBKey m_key;
 };
 
 template <typename ReturnType>
@@ -282,9 +368,9 @@ void DBConnector::hgetall(const std::string &key, OutputIterator result)
 template<typename InputIterator>
 void DBConnector::hmset(const std::string &key, InputIterator start, InputIterator stop)
 {
-    RedisCommand shmset;
-    shmset.formatHMSET(key, start, stop);
-    RedisReply r(this, shmset, REDIS_REPLY_STATUS);
+    RedisCommand shset;
+    shset.formatHSET(key, start, stop);
+    RedisReply r(this, shset, REDIS_REPLY_INTEGER);
 }
 
 }

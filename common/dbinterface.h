@@ -34,6 +34,7 @@ class DBInterface
 public:
     void connect(int dbId, const std::string& dbName, bool retry = true);
     void close(const std::string& dbName);
+    void close();
     int64_t del(const std::string& dbName, const std::string& key, bool blocking = false);
     // Delete all keys which match %pattern from DB
     void delete_all_by_pattern(const std::string& dbName, const std::string& pattern);
@@ -77,28 +78,12 @@ private:
     void _onetime_connect(int dbId, const std::string& dbName);
     // Keep reconnecting to Database 'dbId' until success
     void _persistent_connect(int dbId, const std::string& dbName);
+    void _connect(int dbId, const std::string& dbName, bool retry,
+                  const std::string& unixPath, const std::string& host, int port);
 
-    // Pub-sub keyspace pattern
+    // Redis keyspace notifications must be enabled by server configuration before
+    // callers subscribe through this interface.
     static constexpr const char *KEYSPACE_PATTERN = "__key*__:*";
-
-    // In Redis, by default keyspace events notifications are disabled because while not
-    // very sensible the feature uses some CPU power. Notifications are enabled using
-    // the notify-keyspace-events of redis.conf or via the CONFIG SET.
-    // In order to enable the feature a non-empty string is used, composed of multiple characters,
-    // where every character has a special meaning according to the following table:
-    // K - Keyspace events, published with __keyspace@<db>__ prefix.
-    // E - Keyevent events, published with __keyevent@<db>__ prefix.
-    // g - Generic commands (non-type specific) like DEL, EXPIRE, RENAME, ...
-    // $ - String commands
-    // l - List commands
-    // s - Set commands
-    // h - Hash commands
-    // z - Sorted set commands
-    // x - Expired events (events generated every time a key expires)
-    // e - Evicted events (events generated when a key is evicted for maxmemory)
-    // A - Alias for g$lshzxe, so that the "AKE" string means all the events.
-    // ACS Redis db mainly uses hash, therefore h is selected.
-    static constexpr const char *KEYSPACE_EVENTS = "KEA";
 
     std::unordered_map<std::string, std::shared_ptr<DBConnector>> keyspace_notification_channels;
 

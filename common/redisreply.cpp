@@ -4,9 +4,9 @@
 #include <vector>
 #include <iostream>
 #include <sstream>
-#include <system_error>
 #include <functional>
 #include <boost/algorithm/string.hpp>
+#include <nlohmann/json.hpp>
 
 #include "common/logger.h"
 #include "common/redisreply.h"
@@ -60,25 +60,9 @@ static set<string> g_strToBoolCommands = {
                         "SET"
                         };
 
-template <typename FUNC>
-inline void guard(FUNC func, const char* command)
-{
-    try
-    {
-        func();
-    }
-    catch (const system_error& ex)
-    {
-        // Combine more error message and throw again
-        string errmsg = "RedisReply catches system_error: command: " + string(command) + ", reason: " + ex.what();
-        SWSS_LOG_ERROR("%s", errmsg.c_str());
-        throw system_error(ex.code(), errmsg.c_str());
-    }
-}
-
 RedisReply::RedisReply(RedisContext *ctx, const RedisCommand& command)
 {
-    int rc = redisAppendFormattedCommand(ctx->getContext(), command.c_str(), command.length());
+    int rc = command.appendTo(ctx->getContext());
     if (rc != REDIS_OK)
     {
         // The only reason of error is REDIS_ERR_OOM (Out of memory)
@@ -89,9 +73,9 @@ RedisReply::RedisReply(RedisContext *ctx, const RedisCommand& command)
     rc = redisGetReply(ctx->getContext(), (void**)&m_reply);
     if (rc != REDIS_OK)
     {
-        throw RedisError("Failed to redisGetReply with " + string(command.c_str()), ctx->getContext());
+        throw RedisError("Failed to redisGetReply with " + command.toPrintableString(), ctx->getContext());
     }
-    guard([&]{checkReply();}, command.c_str());
+    guard([&]{checkReply();}, command.toPrintableString().c_str());
 }
 
 RedisReply::RedisReply(RedisContext *ctx, const string& command)
@@ -109,19 +93,19 @@ RedisReply::RedisReply(RedisContext *ctx, const string& command)
     {
         throw RedisError("Failed to redisGetReply with " + command, ctx->getContext());
     }
-    guard([&]{checkReply();}, command.c_str());
+    guard([&]{checkReply();}, binary_to_printable(command.c_str(), command.length()).c_str());
 }
 
 RedisReply::RedisReply(RedisContext *ctx, const RedisCommand& command, int expectedType)
     : RedisReply(ctx, command)
 {
-    guard([&]{checkReplyType(expectedType);}, command.c_str());
+    guard([&]{checkReplyType(expectedType);}, command.toPrintableString().c_str());
 }
 
 RedisReply::RedisReply(RedisContext *ctx, const string& command, int expectedType)
     : RedisReply(ctx, command)
 {
-    guard([&]{checkReplyType(expectedType);}, command.c_str());
+    guard([&]{checkReplyType(expectedType);}, binary_to_printable(command.c_str(), command.length()).c_str());
 }
 
 RedisReply::RedisReply(redisReply *reply) :
@@ -308,6 +292,81 @@ string RedisReply::to_string(redisReply *reply, string command)
     }
 }
 
+static nlohmann::ordered_json buildJsonDict(struct redisReply **element, size_t elements)
+{
+    if (elements%2 != 0)
+    {
+        throw system_error(make_error_code(errc::io_error),
+                           "Invalid result");
+    }
+
+    auto result = nlohmann::ordered_json::object();
+    for (size_t i = 0; i < elements; i += 2)
+    {
+        result[RedisReply::to_string(element[i])] = RedisReply::to_string(element[i + 1]);
+    }
+
+    return result;
+}
+
+static nlohmann::ordered_json buildJsonReply(redisReply *reply, const string& command)
+{
+    switch(reply->type)
+    {
+    case REDIS_REPLY_INTEGER:
+        return reply->integer;
+
+    case REDIS_REPLY_NIL:
+        return nullptr;
+
+    case REDIS_REPLY_STRING:
+    case REDIS_REPLY_ERROR:
+    case REDIS_REPLY_STATUS:
+        return string(reply->str, reply->len);
+
+    case REDIS_REPLY_ARRAY:
+    {
+        if (command == "HGETALL")
+        {
+            return buildJsonDict(reply->element, reply->elements);
+        }
+
+        if (command == "HSCAN" && reply->elements == 2 &&
+            reply->element[1]->type == REDIS_REPLY_ARRAY)
+        {
+            auto result = nlohmann::ordered_json::array();
+            result.push_back(buildJsonReply(reply->element[0], string()));
+            result.push_back(buildJsonDict(reply->element[1]->element, reply->element[1]->elements));
+            return result;
+        }
+
+        auto result = nlohmann::ordered_json::array();
+        for (size_t i = 0; i < reply->elements; i++)
+        {
+            result.push_back(buildJsonReply(reply->element[i], string()));
+        }
+        return result;
+    }
+
+    default:
+        SWSS_LOG_ERROR("invalid type %d for message", reply->type);
+        return nullptr;
+    }
+}
+
+string RedisReply::to_json_string(redisReply *reply, string command)
+{
+    /*
+        JSON output mode for sonic-db-cli --json.
+        Unlike to_string(), this does not emulate redis-py output: replies map
+        directly to JSON types (integer -> number, nil -> null, status/error -> string),
+        except that HGETALL (and the field map element of HSCAN) become a JSON object.
+        Bytes that are not valid UTF-8 are replaced with U+FFFD rather than failing.
+    */
+    auto result = buildJsonReply(reply, command);
+    return result.dump(-1, ' ', false, nlohmann::ordered_json::error_handler_t::replace);
+}
+
 string RedisReply::formatReply(string command, long long integer)
 {
     if (g_intToBoolCommands.find(command) != g_intToBoolCommands.end())
@@ -339,6 +398,19 @@ string RedisReply::formatReply(string command, const char* str, size_t len)
         && result == "OK")
     {
         return string("True");
+    }
+    
+    if (command == "PING")
+    {
+        // In redis-py, result for PING was hard coded: https://github.com/redis/redis-py/blob/bedf3c82a55b4b67eed93f686cb17e82f7ab19cd/redis/client.py#L796
+        if (result == "PONG")
+        {
+            return string("True");
+        }
+        else
+        {
+            return string("False");
+        }
     }
 
     return result;
@@ -421,7 +493,9 @@ string RedisReply::formatDictReply(struct redisReply **element, size_t elements)
     vector<string> elementvector;
     for (unsigned int i = 0; i < elements; i += 2)
     {
-        elementvector.push_back("'" + to_string(element[i]) + "': '" + to_string(element[i+1]) + "'");
+        string key = formatStringWithQuot(to_string(element[i]));
+        string value = formatStringWithQuot(to_string(element[i + 1]));
+        elementvector.push_back(key + ": " + value);
     }
 
     return swss::join(", ", '{', '}', elementvector.begin(), elementvector.end());
@@ -432,7 +506,7 @@ string RedisReply::formatArrayReply(struct redisReply **element, size_t elements
     vector<string> elementvector;
     for (unsigned int i = 0; i < elements; i++)
     {
-        elementvector.push_back("'" + to_string(element[i]) + "'");
+        elementvector.push_back(formatStringWithQuot(to_string(element[i])));
     }
 
     return swss::join(", ", '[', ']', elementvector.begin(), elementvector.end());
@@ -454,10 +528,20 @@ string RedisReply::formatTupleReply(struct redisReply **element, size_t elements
     vector<string> elementvector;
     for (unsigned int i = 0; i < elements; i++)
     {
-        elementvector.push_back("'" + to_string(element[i]) + "'");
+        elementvector.push_back(formatStringWithQuot(to_string(element[i])));
     }
 
     return swss::join(", ", '(', ')', elementvector.begin(), elementvector.end());
+}
+
+string RedisReply::formatStringWithQuot(string str)
+{
+    if (str.find('\'') != std::string::npos)
+    {
+        return "\"" + str + "\"";
+    }
+    
+    return "'" + str + "'";
 }
 
 }

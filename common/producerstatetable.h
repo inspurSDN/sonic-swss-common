@@ -12,7 +12,8 @@ class ProducerStateTable : public TableBase, public TableName_KeySet
 public:
     ProducerStateTable(DBConnector *db, const std::string &tableName);
     ProducerStateTable(RedisPipeline *pipeline, const std::string &tableName, bool buffered = false);
-    ~ProducerStateTable();
+    ProducerStateTable(RedisPipeline *pipeline, const std::string &tableName, bool buffered, bool flushPub);
+    virtual ~ProducerStateTable();
 
     void setBuffered(bool buffered);
     /* Implements set() and del() commands using notification messages */
@@ -25,7 +26,7 @@ public:
                      const std::string &op = DEL_COMMAND,
                      const std::string &prefix = EMPTY_PREFIX);
 
-#ifdef SWIG
+#if defined(SWIG) && defined(SWIGPYTHON)
     // SWIG interface file (.i) globally rename map C++ `del` to python `delete`,
     // but applications already followed the old behavior of auto renamed `_del`.
     // So we implemented old behavior for backward compatibility
@@ -51,6 +52,7 @@ public:
 
     void apply_temp_view();
 private:
+    bool m_flushPub; // publish per piepeline flush intead of per redis script
     bool m_buffered;
     bool m_pipeowned;
     bool m_tempViewActive;
@@ -62,6 +64,8 @@ private:
     std::string m_shaClear;
     std::string m_shaApplyView;
     TableDump m_tempViewState;
+
+    void reloadRedisScript(); // redis script may change if m_buffered changes
 };
 
 }

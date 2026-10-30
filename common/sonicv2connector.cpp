@@ -17,7 +17,7 @@ std::string SonicV2Connector_Native::getNamespace() const
 
 void SonicV2Connector_Native::connect(const std::string& db_name, bool retry_on)
 {
-    if (m_use_unix_socket_path)
+    if (m_use_unix_socket_path || get_db_port(db_name) == 0)
     {
         m_dbintf.set_redis_kwargs(get_db_socket(db_name), "", 0);
     }
@@ -32,6 +32,11 @@ void SonicV2Connector_Native::connect(const std::string& db_name, bool retry_on)
 void SonicV2Connector_Native::close(const std::string& db_name)
 {
     m_dbintf.close(db_name);
+}
+
+void SonicV2Connector_Native::close()
+{
+    m_dbintf.close();
 }
 
 std::vector<std::string> SonicV2Connector_Native::get_db_list()

@@ -1,13 +1,15 @@
 #include <vector>
 #include <hiredis/hiredis.h>
 #include "rediscommand.h"
+#include "stringutility.h"
 
 using namespace std;
 
 namespace swss {
 
 RedisCommand::RedisCommand()
- : temp(NULL)
+ : temp(NULL),
+   len(0)
 {
 }
 
@@ -23,16 +25,18 @@ void RedisCommand::format(const char *fmt, ...)
         redisFreeCommand(temp);
         temp = nullptr;
     }
+    len = 0;
 
     va_list ap;
     va_start(ap, fmt);
-    int len = redisvFormatCommand(&temp, fmt, ap);
+    int ret = redisvFormatCommand(&temp, fmt, ap);
     va_end(ap);
-    if (len == -1) {
+    if (ret == -1) {
         throw std::bad_alloc();
-    } else if (len == -2) {
+    } else if (ret == -2) {
         throw std::invalid_argument("fmt");
     }
+    len = ret;
 }
 
 void RedisCommand::formatArgv(int argc, const char **argv, const size_t *argvlen)
@@ -42,28 +46,38 @@ void RedisCommand::formatArgv(int argc, const char **argv, const size_t *argvlen
         redisFreeCommand(temp);
         temp = nullptr;
     }
+    len = 0;
 
-    int len = redisFormatCommandArgv(&temp, argc, argv, argvlen);
-    if (len == -1) {
+    long long ret = redisFormatCommandArgv(&temp, argc, argv, argvlen);
+    if (ret == -1) {
         throw std::bad_alloc();
     }
+    len = (int)ret;
 }
 
 void RedisCommand::format(const vector<string> &commands)
 {
     vector<const char*> args;
+    vector<size_t> lens;
     for (auto& command : commands)
     {
         args.push_back(command.c_str());
+        lens.push_back(command.size());
     }
-    formatArgv(static_cast<int>(args.size()), args.data(), NULL);
+    formatArgv(static_cast<int>(args.size()), args.data(), lens.data());
 }
 
-/* Format HMSET key multiple field value command */
-void RedisCommand::formatHMSET(const std::string &key,
+/* Format HSET key multiple field value command */
+void RedisCommand::formatHSET(const std::string &key,
                                const std::vector<FieldValueTuple> &values)
 {
-    formatHMSET(key, values.begin(), values.end());
+    formatHSET(key, values.begin(), values.end());
+}
+
+void RedisCommand::formatHSET(const std::string &key,
+                              const std::map<std::string, std::string> &values)
+{
+    formatHSET(key, values.begin(), values.end());
 }
 
 /* Format HSET key field value command */
@@ -90,12 +104,9 @@ void RedisCommand::formatHDEL(const std::string& key, const std::vector<std::str
 {
     if (fields.empty()) throw std::invalid_argument("empty values");
 
-    std::vector<const char *> args = {"HDEL", key.c_str()};
-    for (const std::string &f : fields)
-    {
-        args.push_back(f.c_str());
-    }
-    formatArgv(static_cast<int>(args.size()), args.data(), NULL);
+    std::vector<string> args = {"HDEL", key};
+    args.insert(args.end(), fields.begin(), fields.end());
+    format(args);
 }
 
 /* Format EXPIRE key field command */
@@ -110,14 +121,44 @@ void RedisCommand::formatTTL(const std::string& key)
     return format("TTL %s", key.c_str());
 }
 
+/* Format DEL key command */
+void RedisCommand::formatDEL(const std::string& key)
+{
+    return format("DEL %s", key.c_str());
+}
+
+/* Format DEL multiple keys command */
+void RedisCommand::formatDEL(const std::vector<std::string>& keys)
+{
+    if (keys.empty()) throw std::invalid_argument("empty values");
+
+    std::vector<string> args = {"DEL"};
+    args.insert(args.end(), keys.begin(), keys.end());
+    format(args);
+}
+
+int RedisCommand::appendTo(redisContext *ctx) const
+{
+    return redisAppendFormattedCommand(ctx, c_str(), length());
+}
+
+std::string RedisCommand::toPrintableString() const
+{
+    return binary_to_printable(temp, len);
+}
+
 const char *RedisCommand::c_str() const
 {
+    if (len == 0)
+        return nullptr;
     return temp;
 }
 
 size_t RedisCommand::length() const
 {
-    return strlen(temp);
+    if (len <= 0)
+        return 0;
+    return static_cast<size_t>(len);
 }
 
 }

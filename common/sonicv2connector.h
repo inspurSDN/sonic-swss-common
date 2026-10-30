@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 #include <unistd.h>
+#include <string>
 
 #include "dbinterface.h"
 
@@ -18,6 +19,8 @@ public:
     void connect(const std::string& db_name, bool retry_on = true);
 
     void close(const std::string& db_name);
+
+    void close();
 
     std::vector<std::string> get_db_list();
 
@@ -61,7 +64,7 @@ private:
     std::string m_netns;
 };
 
-#ifdef SWIG
+#if defined(SWIG) && defined(SWIGPYTHON)
 %pythoncode %{
     class SonicV2Connector(SonicV2Connector_Native):
 
@@ -91,6 +94,12 @@ private:
 
         def keys(self, *args, **kwargs):
             return list(super(SonicV2Connector, self).keys(*args, **kwargs))
+
+        def set(self, db_name, _hash, key, value, blocking=False):
+            if isinstance(value, str):
+                return super(SonicV2Connector, self).set(db_name, _hash, key, value, blocking)
+
+            return super(SonicV2Connector, self).set(db_name, _hash, key, str(value), blocking)
 %}
 #endif
 }

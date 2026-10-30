@@ -2,6 +2,7 @@
 #include <cstring>
 #include <array>
 #include <sys/wait.h>
+#include <stdexcept>
 #include "exec.h"
 #include "common/logger.h"
 
@@ -25,12 +26,9 @@ int exec(const string &cmd, string &stdout)
     }
 
     stdout.clear();
-    while (!feof(pipe))
+    while (fgets(buffer.data(), buffsz, pipe) != NULL)
     {
-        if (fgets(buffer.data(), buffsz, pipe) != NULL)
-        {
-            stdout += buffer.data();
-        }
+        stdout += buffer.data();
     }
 
     int ret;
